@@ -27,7 +27,11 @@ type PendingRequest = {
   action: string;
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
-  timeoutId: number;
+};
+
+type ExpirationEntry = {
+  id: string;
+  expiresAt: number;
 };
 
 function asRecord(value: unknown): UnknownRecord {
@@ -80,6 +84,35 @@ function sanitizeNotificationDetails(details: unknown): AnyObject {
 // Request/response plumbing for GM.* promises API.
 let seq = 0;
 const pending = new Map<string, PendingRequest>();
+const expirationQueue: ExpirationEntry[] = [];
+let safetyTimeoutId: ReturnType<typeof setTimeout> | null = null;
+
+function processExpirationQueue(): void {
+  safetyTimeoutId = null;
+  const now = Date.now();
+
+  // Drain all entries that have expired.
+  while (expirationQueue.length > 0) {
+    const head = expirationQueue[0];
+    if (head.expiresAt > now) break;
+    expirationQueue.shift();
+
+    const item = pending.get(head.id);
+    if (!item) continue; // already resolved/rejected
+    pending.delete(head.id);
+    debug.warn("[VOT EXT][prelude] GM API timeout", {
+      requestId: head.id,
+      action: item.action,
+    });
+    item.reject(new Error(`VOT bridge timeout for ${item.action}`));
+  }
+
+  // Re-arm timer for the next pending expiration, if any.
+  if (expirationQueue.length > 0) {
+    const delay = Math.max(0, expirationQueue[0].expiresAt - Date.now());
+    safetyTimeoutId = globalThis.setTimeout(processExpirationQueue, delay);
+  }
+}
 
 function makeId(): string {
   seq += 1;
@@ -92,16 +125,6 @@ function request<T = unknown>(
 ): Promise<T> {
   const id = makeId();
   return new Promise<T>((resolve, reject) => {
-    // Safety timeout so calls don't hang forever if the bridge isn't available.
-    const timeoutId = globalThis.setTimeout(() => {
-      pending.delete(id);
-      debug.warn("[VOT EXT][prelude] GM API timeout", {
-        requestId: id,
-        action,
-      });
-      reject(new Error(`VOT bridge timeout for ${action}`));
-    }, BRIDGE_REQUEST_TIMEOUT_MS);
-
     debug.log("[VOT EXT][prelude] GM API request", {
       requestId: id,
       action,
@@ -111,8 +134,18 @@ function request<T = unknown>(
       action,
       resolve: (value) => resolve(value as T),
       reject,
-      timeoutId,
     });
+
+    // Centralized expiration queue: single timer instead of per-request.
+    const expiresAt = Date.now() + BRIDGE_REQUEST_TIMEOUT_MS;
+    expirationQueue.push({ id, expiresAt });
+    if (safetyTimeoutId === null) {
+      safetyTimeoutId = globalThis.setTimeout(
+        processExpirationQueue,
+        BRIDGE_REQUEST_TIMEOUT_MS,
+      );
+    }
+
     postToBridge({ type: TYPE_REQ, id, action, payload });
   });
 }
@@ -486,8 +519,8 @@ function handlePromiseResponse(data: AnyObject): boolean {
   const item = pending.get(id);
   if (!item) return true;
 
+  // Remove from pending; the expiration queue will skip it on next sweep.
   pending.delete(id);
-  clearTimeout(item.timeoutId);
   if (data.ok) {
     debug.log("[VOT EXT][prelude] GM API response", {
       requestId: id,
